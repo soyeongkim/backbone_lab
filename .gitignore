@@ -1,43 +1,18 @@
-**__pycache__
-.vscode
-CLAUDE.md
-.polyscope.ini
-.venv/
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
 
-external/
-runs/
-extra_info/
-wandb/
-outputs/
-extra_info/
-eval/
-extra_info/
-
-debug_**
-
-utils/ngc/grid_search_configs
-
-imgui.ini
-data
-
-thirdparty/kaolin/
-
-threedgrt_tracer/.ninja_log
-threedgrt_tracer/include/3dgrt/kernels/slang/*.cuh*
-*.egg-info
-.idea
-
-grid_search
-
-libs/
-results/
-thirdparty/ncore/
-
-playground/assets/
-
-assets/nvidia-hq.gif
-assets/playground_glass.gif
-
-uv.lock
-
+# 체크포인트 (용량 큼)
+ckpt/
 *.pth
+
+# 출력 결과물
+feature_viz/
+
+# 외부 라이브러리 (editable install)
+GroundingDINO/
+
+# IDE
+.vscode/
+.idea/

@@ -1,6 +1,6 @@
 """
 Foundation Model Feature Visualization
-- CLIP, DINOv2, SAM 세 모델의 feature 추출
+- CLIP, DINOv2, SAM, Grounded SAM 네 모델의 feature 추출
 - Heatmap (이미지 위 overlay) + Distribution (t-SNE) 모두 시각화
 - test/ 폴더 안의 모든 이미지 처리
 - 모델 로딩 / Warmup / 순수 추론 시간 분리 측정
@@ -8,14 +8,19 @@ Foundation Model Feature Visualization
 설치:
   pip install open_clip_torch matplotlib scikit-learn pillow opencv-python
   pip install git+https://github.com/facebookresearch/segment-anything.git
+  pip install git+https://github.com/IDEA-Research/GroundingDINO.git
   pip install xformers   # (선택) DINOv2 가속
 
   # SAM 체크포인트 다운로드:
-  wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
+  wget -P ckpt/ https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
+
+  # GroundingDINO 체크포인트 다운로드:
+  wget -P ckpt/ https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
 """
 
 import os
 import glob
+import math
 import time
 import torch
 import torch.nn.functional as F
@@ -35,9 +40,13 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 TEST_DIR = './test'
 OUTPUT_DIR = './feature_viz'
 DINO_IMG_SIZE = 518          # 14의 배수 (518 = 14 * 37 patches)
-SAM_CHECKPOINT = 'sam_vit_b_01ec64.pth'
+SAM_CHECKPOINT = 'ckpt/sam_vit_b_01ec64.pth'
+GDINO_CHECKPOINT = 'ckpt/groundingdino_swint_ogc.pth'
+GDINO_BOX_THRESHOLD = 0.35
+GDINO_TEXT_THRESHOLD = 0.25
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs('ckpt', exist_ok=True)
 
 # CLIP 텍스트 쿼리 (자율주행 시나리오)
 TEXT_QUERIES = [
@@ -363,7 +372,7 @@ def run_sam(image_paths):
 
     if not os.path.exists(SAM_CHECKPOINT):
         print(f"  Checkpoint not found: {SAM_CHECKPOINT}")
-        print("  wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth")
+        print("  wget -P ckpt/ https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth")
         return None, None, None
 
     # ── 모델 로딩 ────────────────────────────────────────
@@ -460,7 +469,337 @@ def viz_sam(image_paths, all_masks):
 
 
 # ──────────────────────────────────────────────────────────
-# 5. Feature 분포 시각화 (t-SNE)
+# 5. Grounding DINO - open-set detection (backbone feature)
+# ──────────────────────────────────────────────────────────
+def _find_gdino_config():
+    try:
+        import groundingdino
+        cfg = os.path.join(os.path.dirname(groundingdino.__file__),
+                           'config', 'GroundingDINO_SwinT_OGC.py')
+        if os.path.exists(cfg):
+            return cfg
+    except Exception:
+        pass
+    return 'GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py'
+
+
+@torch.no_grad()
+def run_grounding_dino(image_paths):
+    print("\n[Grounding DINO]")
+    timings = {}
+
+    try:
+        from groundingdino.util.inference import load_model, load_image, predict
+    except ImportError:
+        print("  Install: pip install git+https://github.com/IDEA-Research/GroundingDINO.git")
+        return None, None, None
+
+    gdino_config = _find_gdino_config()
+    if not os.path.exists(gdino_config):
+        print(f"  GroundingDINO config not found: {gdino_config}")
+        return None, None, None
+    if not os.path.exists(GDINO_CHECKPOINT):
+        print(f"  Checkpoint not found: {GDINO_CHECKPOINT}")
+        print("  wget -P ckpt/ https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth")
+        return None, None, None
+
+    # ── 모델 로딩 ────────────────────────────────────────
+    with Timer() as t:
+        gdino = load_model(gdino_config, GDINO_CHECKPOINT)
+        gdino = gdino.to(DEVICE).eval()
+    timings['load'] = t.elapsed
+    print(f"  Load:    {t.elapsed:.2f}s")
+
+    # Swin-T backbone의 마지막 스테이지 feature를 캡처하는 hook
+    _backbone_feats = {}
+
+    def _hook(module, inp, out):
+        try:
+            feats = out[0] if isinstance(out, (list, tuple)) else out
+            last = feats[-1] if isinstance(feats, (list, tuple)) else feats
+            t = last.tensors if hasattr(last, 'tensors') else last
+            if t.dim() == 4:
+                _backbone_feats['feat'] = t.mean(dim=(2, 3))   # (B, C)
+            elif t.dim() == 3:
+                _backbone_feats['feat'] = t.mean(dim=1)         # (B, C)
+        except Exception:
+            pass
+
+    hook_handle = gdino.backbone.register_forward_hook(_hook)
+
+    text_prompt = ' . '.join(TEXT_QUERIES)
+    all_results = []
+    image_features = []
+    per_image_inference = []
+    per_image_total = []
+
+    for path in image_paths:
+        sync(); t_total_start = time.time()
+
+        _, image_tensor = load_image(path)
+        img_np = np.array(Image.open(path).convert('RGB'))
+        h, w = img_np.shape[:2]
+
+        sync(); t_inf_start = time.time()
+        boxes, logits, phrases = predict(
+            model=gdino,
+            image=image_tensor,
+            caption=text_prompt,
+            box_threshold=GDINO_BOX_THRESHOLD,
+            text_threshold=GDINO_TEXT_THRESHOLD,
+            device=DEVICE,
+        )
+        sync(); t_inf = time.time() - t_inf_start
+
+        feat = _backbone_feats.get('feat')
+        if feat is not None:
+            image_features.append(feat[0].cpu().numpy())
+
+        all_results.append({
+            'boxes': boxes.cpu().numpy() if len(boxes) > 0 else np.array([]),
+            'labels': phrases,
+            'scores': logits.cpu().numpy() if len(logits) > 0 else np.array([]),
+        })
+
+        sync(); t_total = time.time() - t_total_start
+        per_image_inference.append(t_inf)
+        per_image_total.append(t_total)
+
+    hook_handle.remove()
+
+    timings['inference_per_img'] = np.mean(per_image_inference)
+    timings['inference_total'] = np.sum(per_image_inference)
+    timings['per_image_total'] = np.mean(per_image_total)
+    timings['total_pipeline'] = np.sum(per_image_total)
+
+    print(f"  Inference (pure):  {np.mean(per_image_inference)*1000:>7.1f} ms/img"
+          f"  (total {np.sum(per_image_inference):.2f}s)")
+    print(f"  Inference (+I/O):  {np.mean(per_image_total)*1000:>7.1f} ms/img"
+          f"  (total {np.sum(per_image_total):.2f}s)")
+    print(f"  Per-image breakdown: "
+          f"{[f'{t*1000:.0f}ms' for t in per_image_inference]}")
+
+    feats_arr = np.array(image_features) if image_features else None
+    return feats_arr, all_results, timings
+
+
+def viz_grounding_dino(image_paths, all_results):
+    n = len(image_paths)
+    fig, axes = plt.subplots(n, 2, figsize=(14, 5 * n))
+    if n == 1:
+        axes = axes[None, :]
+
+    for i, (path, result) in enumerate(zip(image_paths, all_results)):
+        img = np.array(Image.open(path).convert('RGB'))
+        h, w = img.shape[:2]
+
+        axes[i, 0].imshow(img)
+        axes[i, 0].set_title(f'Original\n{os.path.basename(path)}', fontsize=10)
+        axes[i, 0].axis('off')
+
+        axes[i, 1].imshow(img)
+        for box, label, score in zip(result['boxes'], result['labels'], result['scores']):
+            cx, cy, bw, bh = box
+            x1, y1 = (cx - bw / 2) * w, (cy - bh / 2) * h
+            rect = plt.Rectangle(
+                (x1, y1), bw * w, bh * h,
+                linewidth=2, edgecolor='cyan', facecolor='none'
+            )
+            axes[i, 1].add_patch(rect)
+            axes[i, 1].text(
+                x1, y1 - 4, f'{label} {score:.2f}',
+                color='cyan', fontsize=7, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.1', facecolor='black', alpha=0.5)
+            )
+
+        n_det = len(result['labels'])
+        axes[i, 1].set_title(f'Grounding DINO ({n_det} detections)', fontsize=10)
+        axes[i, 1].axis('off')
+
+    plt.tight_layout()
+    save_path = os.path.join(OUTPUT_DIR, 'grounding_dino_heatmap.png')
+    plt.savefig(save_path, dpi=120, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {save_path}")
+
+
+# ──────────────────────────────────────────────────────────
+# 6. Grounded SAM - text-prompted detection + segmentation
+# ──────────────────────────────────────────────────────────
+@torch.no_grad()
+def run_grounded_sam(image_paths):
+    print("\n[Grounded SAM]")
+    timings = {}
+
+    try:
+        from groundingdino.util.inference import load_model, load_image, predict
+        from segment_anything import sam_model_registry, SamPredictor
+    except ImportError:
+        print("  Install: pip install git+https://github.com/IDEA-Research/GroundingDINO.git")
+        print("           pip install git+https://github.com/facebookresearch/segment-anything.git")
+        return None, None, None
+
+    gdino_config = _find_gdino_config()
+    if not os.path.exists(gdino_config):
+        print(f"  GroundingDINO config not found: {gdino_config}")
+        return None, None, None
+    if not os.path.exists(GDINO_CHECKPOINT):
+        print(f"  Checkpoint not found: {GDINO_CHECKPOINT}")
+        print("  wget -P ckpt/ https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth")
+        return None, None, None
+    if not os.path.exists(SAM_CHECKPOINT):
+        print(f"  SAM checkpoint not found: {SAM_CHECKPOINT}")
+        print("  wget -P ckpt/ https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth")
+        return None, None, None
+
+    # ── 모델 로딩 ────────────────────────────────────────
+    with Timer() as t:
+        gdino = load_model(gdino_config, GDINO_CHECKPOINT)
+        gdino = gdino.to(DEVICE).eval()
+        sam = sam_model_registry['vit_b'](checkpoint=SAM_CHECKPOINT).to(DEVICE)
+        predictor = SamPredictor(sam)
+    timings['load'] = t.elapsed
+    print(f"  Load:    {t.elapsed:.2f}s")
+
+    # TEXT_QUERIES를 Grounding DINO caption 형식으로 변환
+    text_prompt = ' . '.join(TEXT_QUERIES)
+
+    all_results = []
+    image_features = []
+    per_image_inference = []
+    per_image_total = []
+
+    for path in image_paths:
+        sync(); t_total_start = time.time()
+
+        image_source, image_tensor = load_image(path)
+        img_np = np.array(Image.open(path).convert('RGB'))
+        h, w = img_np.shape[:2]
+
+        sync(); t_inf_start = time.time()
+
+        # 1) Grounding DINO: text-prompted box detection
+        boxes, logits, phrases = predict(
+            model=gdino,
+            image=image_tensor,
+            caption=text_prompt,
+            box_threshold=GDINO_BOX_THRESHOLD,
+            text_threshold=GDINO_TEXT_THRESHOLD,
+            device=DEVICE,
+        )
+
+        # 2) SAM: box-prompted segmentation
+        predictor.set_image(img_np)
+        masks_list = np.array([])
+        if len(boxes) > 0:
+            # normalized cx,cy,w,h → pixel x1,y1,x2,y2
+            boxes_xyxy = boxes.clone()
+            boxes_xyxy[:, 0] = (boxes[:, 0] - boxes[:, 2] / 2) * w
+            boxes_xyxy[:, 1] = (boxes[:, 1] - boxes[:, 3] / 2) * h
+            boxes_xyxy[:, 2] = (boxes[:, 0] + boxes[:, 2] / 2) * w
+            boxes_xyxy[:, 3] = (boxes[:, 1] + boxes[:, 3] / 2) * h
+
+            transformed_boxes = predictor.transform.apply_boxes_torch(
+                boxes_xyxy.to(DEVICE), img_np.shape[:2]
+            )
+            masks_tensor, _, _ = predictor.predict_torch(
+                point_coords=None,
+                point_labels=None,
+                boxes=transformed_boxes,
+                multimask_output=False,
+            )
+            masks_list = masks_tensor[:, 0].cpu().numpy()  # (N, H, W)
+
+        embed = predictor.get_image_embedding()
+        global_feat = embed.mean(dim=(2, 3))[0].cpu().numpy()
+
+        sync(); t_inf = time.time() - t_inf_start
+
+        all_results.append({
+            'boxes': boxes.cpu().numpy() if len(boxes) > 0 else np.array([]),
+            'labels': phrases,
+            'scores': logits.cpu().numpy() if len(logits) > 0 else np.array([]),
+            'masks': masks_list,
+        })
+        image_features.append(global_feat)
+
+        sync(); t_total = time.time() - t_total_start
+        per_image_inference.append(t_inf)
+        per_image_total.append(t_total)
+
+    timings['inference_per_img'] = np.mean(per_image_inference)
+    timings['inference_total'] = np.sum(per_image_inference)
+    timings['per_image_total'] = np.mean(per_image_total)
+    timings['total_pipeline'] = np.sum(per_image_total)
+
+    print(f"  Inference (pure):  {np.mean(per_image_inference)*1000:>7.1f} ms/img"
+          f"  (total {np.sum(per_image_inference):.2f}s)")
+    print(f"  Inference (+I/O):  {np.mean(per_image_total)*1000:>7.1f} ms/img"
+          f"  (total {np.sum(per_image_total):.2f}s)")
+    print(f"  Per-image breakdown: "
+          f"{[f'{t*1000:.0f}ms' for t in per_image_inference]}")
+
+    return np.array(image_features), all_results, timings
+
+
+def viz_grounded_sam(image_paths, all_results):
+    n = len(image_paths)
+    fig, axes = plt.subplots(n, 2, figsize=(14, 5 * n))
+    if n == 1:
+        axes = axes[None, :]
+
+    np.random.seed(42)
+    for i, (path, result) in enumerate(zip(image_paths, all_results)):
+        img = np.array(Image.open(path).convert('RGB'))
+        h, w = img.shape[:2]
+
+        axes[i, 0].imshow(img)
+        axes[i, 0].set_title(f'Original\n{os.path.basename(path)}', fontsize=10)
+        axes[i, 0].axis('off')
+
+        axes[i, 1].imshow(img)
+
+        boxes = result['boxes']
+        labels = result['labels']
+        scores = result['scores']
+        masks = result['masks']
+
+        # 마스크 overlay
+        if len(masks) > 0:
+            overlay = np.zeros((*img.shape[:2], 4))
+            for mask in masks:
+                color = np.concatenate([np.random.rand(3), [0.4]])
+                overlay[mask > 0] = color
+            axes[i, 1].imshow(overlay)
+
+        # 박스 + 레이블 표시
+        for box, label, score in zip(boxes, labels, scores):
+            cx, cy, bw, bh = box
+            x1, y1 = (cx - bw / 2) * w, (cy - bh / 2) * h
+            rect = plt.Rectangle(
+                (x1, y1), bw * w, bh * h,
+                linewidth=2, edgecolor='lime', facecolor='none'
+            )
+            axes[i, 1].add_patch(rect)
+            axes[i, 1].text(
+                x1, y1 - 4, f'{label} {score:.2f}',
+                color='lime', fontsize=7, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.1', facecolor='black', alpha=0.5)
+            )
+
+        n_det = len(labels)
+        axes[i, 1].set_title(f'Grounded SAM ({n_det} detections)', fontsize=10)
+        axes[i, 1].axis('off')
+
+    plt.tight_layout()
+    save_path = os.path.join(OUTPUT_DIR, 'grounded_sam_heatmap.png')
+    plt.savefig(save_path, dpi=120, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {save_path}")
+
+
+# ──────────────────────────────────────────────────────────
+# 6. Feature 분포 시각화 (t-SNE)
 # ──────────────────────────────────────────────────────────
 def viz_distribution(features_dict, image_paths):
     print("\n[Distribution] t-SNE visualization...")
@@ -471,9 +810,13 @@ def viz_distribution(features_dict, image_paths):
         return
 
     n_models = len(valid)
-    fig, axes = plt.subplots(1, n_models, figsize=(8 * n_models, 7))
-    if n_models == 1:
-        axes = [axes]
+    n_cols = min(3, n_models)
+    n_rows = math.ceil(n_models / n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(10 * n_cols, 9 * n_rows))
+    axes = np.array(axes).flatten()
+    # 빈 칸 숨기기
+    for idx in range(n_models, len(axes)):
+        axes[idx].set_visible(False)
 
     thumbs = []
     for path in image_paths:
@@ -520,7 +863,7 @@ def viz_distribution(features_dict, image_paths):
 
 
 # ──────────────────────────────────────────────────────────
-# 6. Cross-model 유사도 비교
+# 7. Cross-model 유사도 비교
 # ──────────────────────────────────────────────────────────
 def viz_cross_model_similarity(features_dict, image_paths):
     print("\n[Cross-Model] Similarity matrix...")
@@ -599,27 +942,44 @@ if __name__ == '__main__':
         all_timings['SAM'] = t_sam
         viz_sam(image_paths, sam_masks)
 
-    # ── 4) Feature 분포 (t-SNE) ─────────────────────────
+    # ── 4) Grounding DINO ───────────────────────────────
+    print("\n" + "─" * 70)
+    gdino_feats, gdino_results, t_gdino = run_grounding_dino(image_paths)
+    if gdino_results is not None:
+        all_timings['GroundingDINO'] = t_gdino
+        viz_grounding_dino(image_paths, gdino_results)
+
+    # ── 5) Grounded SAM ─────────────────────────────────
+    print("\n" + "─" * 70)
+    gsam_feats, gsam_results, t_gsam = run_grounded_sam(image_paths)
+    if gsam_results is not None:
+        all_timings['GroundedSAM'] = t_gsam
+        viz_grounded_sam(image_paths, gsam_results)
+
+    # ── 6) Feature 분포 (t-SNE) ─────────────────────────
     print("\n" + "─" * 70)
     feature_dict = {
         'DINOv2': dino_cls,
         'CLIP': clip_feats,
         'SAM': sam_feats,
+        'GroundingDINO': gdino_feats,
+        'GroundedSAM': gsam_feats,
     }
     viz_distribution(feature_dict, image_paths)
 
-    # ── 5) Cross-model 유사도 ───────────────────────────
+    # ── 7) Cross-model 유사도 ───────────────────────────
     viz_cross_model_similarity(feature_dict, image_paths)
 
     # ──────────────────────────────────────────────────────
     # 시간 측정 요약 표
     # ──────────────────────────────────────────────────────
-    print("\n" + "=" * 70)
+    W = 84
+    print("\n" + "=" * W)
     print(f"TIMING SUMMARY ({n_images} images on {DEVICE.upper()})")
-    print("=" * 70)
-    print(f"{'Model':<8} {'Load':>8} {'Warmup':>8} "
+    print("=" * W)
+    print(f"{'Model':<14} {'Load':>7} {'Warmup':>7} "
           f"{'Inf/img':>10} {'Inf+IO/img':>12} {'Total Inf':>11} {'FPS':>7}")
-    print("─" * 70)
+    print("─" * W)
     for name, t in all_timings.items():
         load = t.get('load', 0)
         warmup = t.get('warmup', 0)
@@ -627,10 +987,10 @@ if __name__ == '__main__':
         total_per = t.get('per_image_total', 0) * 1000
         total_inf = t.get('inference_total', 0)
         fps = 1.0 / t['inference_per_img'] if t.get('inference_per_img', 0) > 0 else 0
-        print(f"{name:<8} {load:>6.2f}s  {warmup:>6.2f}s  "
+        print(f"{name:<14} {load:>5.2f}s  {warmup:>5.2f}s  "
               f"{inf_per:>8.1f}ms  {total_per:>10.1f}ms  "
               f"{total_inf:>9.2f}s  {fps:>6.2f}")
-    print("=" * 70)
+    print("=" * W)
 
     # SAM의 단계별 시간 (있을 때)
     if 'SAM' in all_timings:
@@ -646,6 +1006,8 @@ if __name__ == '__main__':
     print("  - dinov2_heatmap.png         : Patch feature PCA-RGB + attention")
     print("  - clip_heatmap.png           : Text-image similarity")
     print("  - sam_heatmap.png            : Automatic segmentation masks")
+    print("  - grounding_dino_heatmap.png : Open-set text-prompted detection boxes")
+    print("  - grounded_sam_heatmap.png   : Text-prompted boxes + SAM masks")
     print("  - feature_distribution.png   : t-SNE comparison across models")
     print("  - cross_model_similarity.png : Image similarity matrix per model")
     print("=" * 70)
