@@ -9,6 +9,8 @@ Foundation Model Feature Visualization
   pip install open_clip_torch matplotlib scikit-learn pillow opencv-python
   pip install git+https://github.com/facebookresearch/segment-anything.git
   pip install git+https://github.com/IDEA-Research/GroundingDINO.git
+  pip install timm                    # MAE
+  pip install transformers sentencepiece protobuf  # SigLIP
   pip install xformers   # (선택) DINOv2 가속
 
   # SAM 체크포인트 다운로드:
@@ -40,6 +42,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 TEST_DIR = './test'
 OUTPUT_DIR = './feature_viz'
 DINO_IMG_SIZE = 518          # 14의 배수 (518 = 14 * 37 patches)
+MAE_IMG_SIZE  = 224          # ViT-B/16: 14×14 = 196 patches
 SAM_CHECKPOINT = 'ckpt/sam_vit_b_01ec64.pth'
 GDINO_CHECKPOINT = 'ckpt/groundingdino_swint_ogc.pth'
 GDINO_BOX_THRESHOLD = 0.35
@@ -248,6 +251,127 @@ def viz_dinov2_heatmap(image_paths, patch_features_list):
 
 
 # ──────────────────────────────────────────────────────────
+# 2b. MAE - patch feature → PCA RGB + attention heatmap
+# ──────────────────────────────────────────────────────────
+@torch.no_grad()
+def run_mae(image_paths):
+    print("\n[MAE]")
+    timings = {}
+
+    try:
+        import timm
+    except ImportError:
+        print("  Install: pip install timm")
+        return None, None, None
+
+    with Timer() as t:
+        mae = timm.create_model(
+            'vit_base_patch16_224.mae', pretrained=True, num_classes=0
+        ).to(DEVICE).eval()
+    timings['load'] = t.elapsed
+    print(f"  Load:    {t.elapsed:.2f}s")
+
+    transform = T.Compose([
+        T.Resize((MAE_IMG_SIZE, MAE_IMG_SIZE)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    with Timer() as t:
+        if DEVICE == 'cuda':
+            dummy = torch.randn(1, 3, MAE_IMG_SIZE, MAE_IMG_SIZE).to(DEVICE)
+            _ = mae.forward_features(dummy)
+    timings['warmup'] = t.elapsed
+    print(f"  Warmup:  {t.elapsed:.2f}s")
+
+    cls_features        = []
+    patch_features_list = []
+    per_image_inference = []
+    per_image_total     = []
+
+    for path in image_paths:
+        sync(); t_total_start = time.time()
+
+        img = Image.open(path).convert('RGB')
+        x   = transform(img).unsqueeze(0).to(DEVICE)
+
+        sync(); t_inf_start = time.time()
+        tokens = mae.forward_features(x)   # (1, 197, 768): [CLS, p0…p195]
+        sync(); t_inf = time.time() - t_inf_start
+
+        cls_features.append(tokens[0, 0].cpu().numpy())
+        patch_features_list.append(tokens[0, 1:].cpu().numpy())   # (196, 768)
+
+        sync(); t_total = time.time() - t_total_start
+        per_image_inference.append(t_inf)
+        per_image_total.append(t_total)
+
+    timings['inference_per_img'] = np.mean(per_image_inference)
+    timings['inference_total']   = np.sum(per_image_inference)
+    timings['per_image_total']   = np.mean(per_image_total)
+    timings['total_pipeline']    = np.sum(per_image_total)
+
+    print(f"  Inference (pure):  {np.mean(per_image_inference)*1000:>7.1f} ms/img"
+          f"  (total {np.sum(per_image_inference):.2f}s)")
+    print(f"  Inference (+I/O):  {np.mean(per_image_total)*1000:>7.1f} ms/img"
+          f"  (total {np.sum(per_image_total):.2f}s)")
+    print(f"  Per-image breakdown: "
+          f"{[f'{t*1000:.0f}ms' for t in per_image_inference]}")
+
+    return np.array(cls_features), patch_features_list, timings
+
+
+def viz_mae_heatmap(image_paths, patch_features_list):
+    """MAE patch features를 PCA RGB + attention overlay로 시각화 (DINOv2와 동일 포맷)"""
+    n = len(image_paths)
+    fig, axes = plt.subplots(n, 4, figsize=(16, 4 * n))
+    if n == 1:
+        axes = axes[None, :]
+
+    for i, (path, feat) in enumerate(zip(image_paths, patch_features_list)):
+        img = Image.open(path).convert('RGB')
+        gs  = int(np.sqrt(feat.shape[0]))   # 14
+
+        pca     = PCA(n_components=3)
+        feat_3d = pca.fit_transform(feat)
+        feat_3d = (feat_3d - feat_3d.min(0)) / (feat_3d.max(0) - feat_3d.min(0) + 1e-8)
+        rgb_grid = feat_3d.reshape(gs, gs, 3)
+        fg_map   = feat_3d[:, 0].reshape(gs, gs)
+
+        axes[i, 0].imshow(img.resize((MAE_IMG_SIZE, MAE_IMG_SIZE)))
+        axes[i, 0].set_title(f'Original\n{os.path.basename(path)}', fontsize=9)
+        axes[i, 0].axis('off')
+
+        rgb_resized = np.clip(
+            cv2.resize(rgb_grid, (MAE_IMG_SIZE, MAE_IMG_SIZE),
+                       interpolation=cv2.INTER_CUBIC), 0, 1)
+        axes[i, 1].imshow(rgb_resized)
+        axes[i, 1].set_title('MAE PCA-RGB\n(patch features)', fontsize=9)
+        axes[i, 1].axis('off')
+
+        overlay = overlay_heatmap(img.resize((MAE_IMG_SIZE, MAE_IMG_SIZE)),
+                                   fg_map, alpha=0.5, cmap='jet')
+        axes[i, 2].imshow(overlay)
+        axes[i, 2].set_title('Foreground Attention\n(1st PC overlay)', fontsize=9)
+        axes[i, 2].axis('off')
+
+        center_idx  = (gs // 2) * gs + (gs // 2)
+        sim_norm    = F.normalize(torch.tensor(feat), dim=-1).numpy()
+        cos_sim     = (sim_norm @ sim_norm[center_idx:center_idx+1].T).reshape(gs, gs)
+        sim_overlay = overlay_heatmap(img.resize((MAE_IMG_SIZE, MAE_IMG_SIZE)),
+                                       cos_sim, alpha=0.5, cmap='viridis')
+        axes[i, 3].imshow(sim_overlay)
+        axes[i, 3].set_title('Self-Similarity\n(from center patch)', fontsize=9)
+        axes[i, 3].axis('off')
+
+    plt.tight_layout()
+    save_path = os.path.join(OUTPUT_DIR, 'mae_heatmap.png')
+    plt.savefig(save_path, dpi=120, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {save_path}")
+
+
+# ──────────────────────────────────────────────────────────
 # 3. CLIP - 이미지 feature + 텍스트 유사도
 # ──────────────────────────────────────────────────────────
 @torch.no_grad()
@@ -350,6 +474,146 @@ def viz_clip(image_paths, similarities):
 
     plt.tight_layout()
     save_path = os.path.join(OUTPUT_DIR, 'clip_heatmap.png')
+    plt.savefig(save_path, dpi=120, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {save_path}")
+
+
+# ──────────────────────────────────────────────────────────
+# 3b. SigLIP - patch feature + sigmoid text similarity
+# ──────────────────────────────────────────────────────────
+@torch.no_grad()
+def run_siglip(image_paths):
+    print("\n[SigLIP]")
+    timings = {}
+
+    try:
+        from transformers import AutoProcessor, AutoModel
+    except ImportError:
+        print("  Install: pip install transformers")
+        return None, None, None, None
+
+    try:
+        with Timer() as t:
+            siglip    = AutoModel.from_pretrained(
+                'google/siglip-base-patch16-224'
+            ).to(DEVICE).eval()
+            processor = AutoProcessor.from_pretrained('google/siglip-base-patch16-224')
+        timings['load'] = t.elapsed
+        print(f"  Load:    {t.elapsed:.2f}s")
+    except Exception as e:
+        print(f"  Load failed: {e}")
+        print("  Install: pip install sentencepiece protobuf")
+        return None, None, None, None
+
+    with Timer() as t:
+        text_inputs = processor(
+            text=TEXT_QUERIES, return_tensors='pt', padding='max_length'
+        ).to(DEVICE)
+        text_feats  = F.normalize(siglip.get_text_features(**text_inputs), dim=-1)
+    timings['text_encode'] = t.elapsed
+    print(f"  Text encoding ({len(TEXT_QUERIES)} queries): {t.elapsed*1000:.1f} ms")
+
+    with Timer() as t:
+        if DEVICE == 'cuda':
+            dummy = torch.randn(1, 3, 224, 224).to(DEVICE)
+            _ = siglip.vision_model(pixel_values=dummy)
+    timings['warmup'] = t.elapsed
+    print(f"  Warmup:  {t.elapsed:.2f}s")
+
+    # SigLIP은 softmax 대신 per-class sigmoid 사용
+    scale = siglip.logit_scale.exp().item() if hasattr(siglip, 'logit_scale') else 10.0
+    bias  = siglip.logit_bias.item()        if hasattr(siglip, 'logit_bias')  else 0.0
+
+    image_features      = []
+    patch_features_list = []
+    similarities        = []
+    per_image_inference = []
+    per_image_total     = []
+
+    for path in image_paths:
+        sync(); t_total_start = time.time()
+
+        img           = Image.open(path).convert('RGB')
+        vision_inputs = processor(images=img, return_tensors='pt').to(DEVICE)
+        pv            = vision_inputs['pixel_values']
+
+        sync(); t_inf_start = time.time()
+        vision_out = siglip.vision_model(pixel_values=pv)
+        img_feat   = F.normalize(siglip.get_image_features(pixel_values=pv), dim=-1)
+        sim        = torch.sigmoid(scale * (img_feat @ text_feats.T) + bias)
+        sync(); t_inf = time.time() - t_inf_start
+
+        # last_hidden_state: (1, 196, 768) — SigLIP은 CLS 토큰 없음, 전부 patch
+        patch_features_list.append(vision_out.last_hidden_state[0].cpu().numpy())
+        image_features.append(img_feat[0].cpu().numpy())
+        similarities.append(sim[0].cpu().numpy())
+
+        sync(); t_total = time.time() - t_total_start
+        per_image_inference.append(t_inf)
+        per_image_total.append(t_total)
+
+    timings['inference_per_img'] = np.mean(per_image_inference)
+    timings['inference_total']   = np.sum(per_image_inference)
+    timings['per_image_total']   = np.mean(per_image_total)
+    timings['total_pipeline']    = np.sum(per_image_total)
+
+    print(f"  Inference (pure):  {np.mean(per_image_inference)*1000:>7.1f} ms/img"
+          f"  (total {np.sum(per_image_inference):.2f}s)")
+    print(f"  Inference (+I/O):  {np.mean(per_image_total)*1000:>7.1f} ms/img"
+          f"  (total {np.sum(per_image_total):.2f}s)")
+    print(f"  Per-image breakdown: "
+          f"{[f'{t*1000:.0f}ms' for t in per_image_inference]}")
+
+    return np.array(image_features), patch_features_list, similarities, timings
+
+
+def viz_siglip(image_paths, patch_features_list, similarities):
+    """SigLIP: patch PCA-RGB + sigmoid text similarity 동시 시각화"""
+    n = len(image_paths)
+    fig, axes = plt.subplots(n, 4, figsize=(18, 4 * n))
+    if n == 1:
+        axes = axes[None, :]
+
+    for i, (path, feat, sim) in enumerate(
+            zip(image_paths, patch_features_list, similarities)):
+        img = Image.open(path).convert('RGB')
+        gs  = int(np.sqrt(feat.shape[0]))   # 14 (CLS 없으므로 196 → √196=14)
+
+        pca     = PCA(n_components=3)
+        feat_3d = pca.fit_transform(feat)
+        feat_3d = (feat_3d - feat_3d.min(0)) / (feat_3d.max(0) - feat_3d.min(0) + 1e-8)
+        rgb_grid = feat_3d.reshape(gs, gs, 3)
+        fg_map   = feat_3d[:, 0].reshape(gs, gs)
+
+        axes[i, 0].imshow(img.resize((224, 224)))
+        axes[i, 0].set_title(f'Original\n{os.path.basename(path)}', fontsize=9)
+        axes[i, 0].axis('off')
+
+        rgb_resized = np.clip(
+            cv2.resize(rgb_grid, (224, 224), interpolation=cv2.INTER_CUBIC), 0, 1)
+        axes[i, 1].imshow(rgb_resized)
+        axes[i, 1].set_title('SigLIP PCA-RGB\n(patch features)', fontsize=9)
+        axes[i, 1].axis('off')
+
+        overlay = overlay_heatmap(img.resize((224, 224)),
+                                   fg_map, alpha=0.5, cmap='jet')
+        axes[i, 2].imshow(overlay)
+        axes[i, 2].set_title('Foreground Attention\n(1st PC overlay)', fontsize=9)
+        axes[i, 2].axis('off')
+
+        colors = plt.cm.viridis(sim / (sim.max() + 1e-8))
+        axes[i, 3].barh(range(len(TEXT_QUERIES)), sim, color=colors)
+        axes[i, 3].set_yticks(range(len(TEXT_QUERIES)))
+        axes[i, 3].set_yticklabels(TEXT_QUERIES, fontsize=9)
+        axes[i, 3].set_xlabel('Similarity (sigmoid)')
+        axes[i, 3].set_title('SigLIP Text Similarity\n(sigmoid, not softmax)', fontsize=9)
+        axes[i, 3].invert_yaxis()
+        top1 = sim.argmax()
+        axes[i, 3].get_yticklabels()[top1].set_fontweight('bold')
+
+    plt.tight_layout()
+    save_path = os.path.join(OUTPUT_DIR, 'siglip_heatmap.png')
     plt.savefig(save_path, dpi=120, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {save_path}")
@@ -873,9 +1137,12 @@ def viz_cross_model_similarity(features_dict, image_paths):
         return
 
     n_models = len(valid)
-    fig, axes = plt.subplots(1, n_models, figsize=(6 * n_models, 5))
-    if n_models == 1:
-        axes = [axes]
+    n_cols = 3
+    n_rows = math.ceil(n_models / n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+    axes = np.array(axes).flatten()
+    for idx in range(n_models, len(axes)):
+        axes[idx].set_visible(False)
 
     names = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
 
@@ -928,46 +1195,62 @@ if __name__ == '__main__':
     all_timings['DINOv2'] = t_dino
     viz_dinov2_heatmap(image_paths, dino_patches)
 
-    # ── 2) CLIP ─────────────────────────────────────────
+    # ── 2) MAE ──────────────────────────────────────────
+    print("\n" + "─" * 70)
+    mae_cls, mae_patches, t_mae = run_mae(image_paths)
+    if mae_cls is not None:
+        all_timings['MAE'] = t_mae
+        viz_mae_heatmap(image_paths, mae_patches)
+
+    # ── 3) CLIP ─────────────────────────────────────────
     print("\n" + "─" * 70)
     clip_feats, clip_sims, t_clip = run_clip(image_paths)
     if clip_feats is not None:
         all_timings['CLIP'] = t_clip
         viz_clip(image_paths, clip_sims)
 
-    # ── 3) SAM ──────────────────────────────────────────
+    # ── 4) SigLIP ───────────────────────────────────────
+    print("\n" + "─" * 70)
+    siglip_feats, siglip_patches, siglip_sims, t_siglip = run_siglip(image_paths)
+    if siglip_feats is not None:
+        all_timings['SigLIP'] = t_siglip
+        viz_siglip(image_paths, siglip_patches, siglip_sims)
+
+    # ── 5) SAM ──────────────────────────────────────────
     print("\n" + "─" * 70)
     sam_feats, sam_masks, t_sam = run_sam(image_paths)
     if sam_masks is not None:
         all_timings['SAM'] = t_sam
         viz_sam(image_paths, sam_masks)
 
-    # ── 4) Grounding DINO ───────────────────────────────
+    # ── 6) Grounding DINO ───────────────────────────────
     print("\n" + "─" * 70)
     gdino_feats, gdino_results, t_gdino = run_grounding_dino(image_paths)
     if gdino_results is not None:
         all_timings['GroundingDINO'] = t_gdino
         viz_grounding_dino(image_paths, gdino_results)
 
-    # ── 5) Grounded SAM ─────────────────────────────────
+    # ── 7) Grounded SAM ─────────────────────────────────
     print("\n" + "─" * 70)
     gsam_feats, gsam_results, t_gsam = run_grounded_sam(image_paths)
     if gsam_results is not None:
         all_timings['GroundedSAM'] = t_gsam
         viz_grounded_sam(image_paths, gsam_results)
 
-    # ── 6) Feature 분포 (t-SNE) ─────────────────────────
+    # ── 8) Feature 분포 (t-SNE) ─────────────────────────
     print("\n" + "─" * 70)
     feature_dict = {
         'DINOv2': dino_cls,
+        'MAE': mae_cls,
         'CLIP': clip_feats,
+        'SigLIP': siglip_feats,
         'SAM': sam_feats,
         'GroundingDINO': gdino_feats,
         'GroundedSAM': gsam_feats,
     }
     viz_distribution(feature_dict, image_paths)
 
-    # ── 7) Cross-model 유사도 ───────────────────────────
+    # ── 9) Cross-model 유사도 ───────────────────────────
     viz_cross_model_similarity(feature_dict, image_paths)
 
     # ──────────────────────────────────────────────────────
@@ -1004,7 +1287,9 @@ if __name__ == '__main__':
     print("\n" + "=" * 70)
     print(f"Done! Check {OUTPUT_DIR}/")
     print("  - dinov2_heatmap.png         : Patch feature PCA-RGB + attention")
+    print("  - mae_heatmap.png            : MAE patch PCA-RGB + attention")
     print("  - clip_heatmap.png           : Text-image similarity")
+    print("  - siglip_heatmap.png         : SigLIP patch PCA-RGB + sigmoid text sim")
     print("  - sam_heatmap.png            : Automatic segmentation masks")
     print("  - grounding_dino_heatmap.png : Open-set text-prompted detection boxes")
     print("  - grounded_sam_heatmap.png   : Text-prompted boxes + SAM masks")
